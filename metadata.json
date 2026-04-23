@@ -1,0 +1,9 @@
+{
+  "name": "Meeting Automation Agent",
+  "description": "An agentic AI workflow that joins live meetings via audio, transcribes in real-time, generates summaries, extracts action items, and drafts follow-up emails.",
+  "requestFramePermissions": [
+    "microphone",
+    "display-capture"
+  ],
+  "majorCapabilities": []
+}
