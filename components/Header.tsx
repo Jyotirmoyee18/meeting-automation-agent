@@ -11,7 +11,7 @@ const Header: React.FC<HeaderProps> = ({ status, onStart }) => {
   return (
     <header className="h-20 border-b border-slate-200 bg-white px-8 flex items-center justify-between sticky top-0 z-10">
       <div className="flex items-center gap-3">
-        <h1 className="text-xl font-bold text-slate-800">Meeting Intelligence</h1>
+        <h1 className="text-xl font-bold text-slate-800">VoxNote AI</h1>
         {status === MeetingStatus.LISTENING && (
           <div className="flex items-center gap-2 px-3 py-1 bg-red-100 rounded-full">
             <span className="w-2 h-2 bg-red-500 rounded-full animate-pulse"></span>
