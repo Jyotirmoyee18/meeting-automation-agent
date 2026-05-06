@@ -11,10 +11,10 @@ const Sidebar: React.FC<SidebarProps> = ({ status }) => {
     <aside className="hidden md:flex flex-col w-64 bg-slate-900 text-slate-300">
       <div className="p-6">
         <div className="flex items-center gap-3 mb-10">
-          <div className="w-10 h-10 bg-indigo-500 rounded-xl flex items-center justify-center shadow-lg shadow-indigo-900/50">
-            <i className="fas fa-robot text-white text-xl"></i>
+          <div className="w-10 h-10 bg-gradient-to-br from-indigo-500 to-purple-600 rounded-xl flex items-center justify-center shadow-lg shadow-indigo-900/50">
+            <i className="fas fa-wave-square text-white text-xl"></i>
           </div>
-          <span className="text-xl font-bold text-white tracking-tight">MeetingAI</span>
+          <span className="text-xl font-bold text-white tracking-tight">VoxNote AI</span>
         </div>
 
         <nav className="space-y-1">

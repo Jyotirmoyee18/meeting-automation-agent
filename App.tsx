@@ -112,7 +112,7 @@ ${itemLines}
 Please review the above and reach out if you have any questions or updates.
 
 Best regards,
-Meeting Agent`;
+VoxNote AI`;
 };
 
 /** Master function — takes raw transcript, returns MeetingData fields */
@@ -166,8 +166,8 @@ const App: React.FC = () => {
       {
         speaker: 'System',
         text: meetingLink
-          ? `Agent joining meeting: ${meetingLink}. Initializing audio bridge...`
-          : 'Meeting Agent initialized. Listening via microphone...',
+          ? `VoxNote AI joining meeting: ${meetingLink}. Initializing audio bridge...`
+          : 'VoxNote AI initialized. Listening via microphone...',
         timestamp: new Date(),
       },
     ]);
@@ -228,48 +228,81 @@ const App: React.FC = () => {
           )}
 
           {status === MeetingStatus.IDLE && !meetingData && (
-            <div className="flex flex-col items-center justify-center h-full text-center py-10">
-              <div className="w-24 h-24 bg-indigo-100 rounded-2xl flex items-center justify-center mb-6 shadow-xl shadow-indigo-100 rotate-3">
-                <i className="fas fa-robot text-indigo-600 text-4xl"></i>
+            <div className="flex flex-col items-center justify-center min-h-[80vh] text-center py-10 px-4 animate-in fade-in zoom-in-95 duration-500">
+              <div className="w-24 h-24 bg-gradient-to-br from-indigo-500 to-purple-600 rounded-3xl flex items-center justify-center mb-8 shadow-2xl shadow-indigo-200 rotate-3 transform hover:rotate-0 transition-transform">
+                <i className="fas fa-wave-square text-white text-4xl"></i>
               </div>
-              <h2 className="text-3xl font-bold text-slate-800 mb-2">Deploy your Meeting Agent</h2>
-              <p className="text-slate-500 max-w-md mx-auto mb-8">
-                Paste a Zoom, Google Meet, or Teams link. The agent will join and handle all documentation.
+              
+              <h1 className="text-4xl md:text-5xl font-extrabold text-slate-900 mb-4 tracking-tight">
+                Meet <span className="text-transparent bg-clip-text bg-gradient-to-r from-indigo-600 to-purple-600">VoxNote AI</span>
+              </h1>
+              <p className="text-lg text-slate-500 max-w-2xl mx-auto mb-10 leading-relaxed">
+                Your intelligent meeting companion. Instantly capture conversations, extract actionable insights, and generate follow-up emails without lifting a finger.
               </p>
 
-              <div className="w-full max-w-lg space-y-4">
-                <div className="relative">
-                  <div className="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none">
-                    <i className="fas fa-link text-slate-400"></i>
+              <div className="w-full max-w-2xl space-y-6 mb-12">
+                <div className="bg-white p-2 rounded-2xl shadow-xl shadow-slate-200/50 border border-slate-100 flex flex-col sm:flex-row gap-2">
+                  <div className="relative flex-1">
+                    <div className="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none">
+                      <i className="fas fa-link text-slate-400"></i>
+                    </div>
+                    <input
+                      type="text"
+                      value={meetingLink}
+                      onChange={e => setMeetingLink(e.target.value)}
+                      placeholder="Paste Zoom, Meet, or Teams link..."
+                      className="block w-full pl-11 pr-4 py-4 border-0 rounded-xl bg-transparent text-slate-900 focus:ring-0 placeholder:text-slate-400 outline-none"
+                    />
                   </div>
-                  <input
-                    type="text"
-                    value={meetingLink}
-                    onChange={e => setMeetingLink(e.target.value)}
-                    placeholder="https://zoom.us/j/123456789..."
-                    className="block w-full pl-11 pr-4 py-4 border border-slate-200 rounded-2xl bg-white text-slate-900 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 shadow-sm transition-all"
-                  />
-                </div>
-
-                <div className="grid grid-cols-2 gap-4">
                   <button
                     onClick={startMeeting}
-                    className="bg-indigo-600 hover:bg-indigo-700 text-white px-8 py-4 rounded-2xl font-bold shadow-lg shadow-indigo-200 transition-all flex items-center justify-center gap-2"
+                    className="bg-indigo-600 hover:bg-indigo-700 text-white px-8 py-4 rounded-xl font-bold shadow-md transition-all flex items-center justify-center gap-2 whitespace-nowrap"
                   >
-                    
-                    Join &amp; Start
-                  </button>
-                  <button
-                    onClick={() => { setMeetingLink(''); startMeeting(); }}
-                    className="bg-white hover:bg-slate-50 text-slate-700 border border-slate-200 px-8 py-4 rounded-2xl font-bold transition-all flex items-center justify-center gap-2"
-                  >
-                    
-                    Use Local Mic
+                    Join Meeting
+                    <i className="fas fa-arrow-right"></i>
                   </button>
                 </div>
-
                 
+                <div className="flex items-center justify-center gap-4 text-sm text-slate-500 font-medium">
+                  <div className="h-px bg-slate-200 w-12"></div>
+                  <span>OR</span>
+                  <div className="h-px bg-slate-200 w-12"></div>
+                </div>
+
+                <button
+                  onClick={() => { setMeetingLink(''); startMeeting(); }}
+                  className="mx-auto bg-white hover:bg-slate-50 text-slate-700 border border-slate-200 px-8 py-3 rounded-xl font-bold transition-all flex items-center justify-center gap-2 shadow-sm"
+                >
+                  <i className="fas fa-microphone text-indigo-500"></i>
+                  Use Local Microphone
+                </button>
               </div>
+
+              {/* Feature Highlights */}
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-6 w-full max-w-4xl text-left mt-8 border-t border-slate-200 pt-12">
+                <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-100 hover:shadow-md transition-shadow">
+                  <div className="w-10 h-10 bg-blue-100 text-blue-600 rounded-lg flex items-center justify-center mb-4">
+                    <i className="fas fa-closed-captioning"></i>
+                  </div>
+                  <h3 className="text-slate-800 font-bold mb-2">Live Transcription</h3>
+                  <p className="text-slate-500 text-sm">Real-time speech-to-text with high accuracy, capturing every detail of your conversation.</p>
+                </div>
+                <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-100 hover:shadow-md transition-shadow">
+                  <div className="w-10 h-10 bg-purple-100 text-purple-600 rounded-lg flex items-center justify-center mb-4">
+                    <i className="fas fa-bolt"></i>
+                  </div>
+                  <h3 className="text-slate-800 font-bold mb-2">Smart Action Items</h3>
+                  <p className="text-slate-500 text-sm">Automatically detects tasks, assignees, and deadlines to keep your team accountable.</p>
+                </div>
+                <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-100 hover:shadow-md transition-shadow">
+                  <div className="w-10 h-10 bg-green-100 text-green-600 rounded-lg flex items-center justify-center mb-4">
+                    <i className="fas fa-envelope-open-text"></i>
+                  </div>
+                  <h3 className="text-slate-800 font-bold mb-2">Auto Follow-ups</h3>
+                  <p className="text-slate-500 text-sm">Generates ready-to-send summary emails the moment your meeting concludes.</p>
+                </div>
+              </div>
+
             </div>
           )}
 
