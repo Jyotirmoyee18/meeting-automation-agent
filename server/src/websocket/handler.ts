@@ -1,6 +1,6 @@
 import WebSocket from 'ws';
 import { v4 as uuidv4 } from 'uuid';
-import { DeepgramProvider, TranscriptionError, TranscriptSegmentData } from '../providers/deepgramProvider';
+import { AssemblyAIProvider, TranscriptionError, TranscriptSegmentData } from '../providers/assemblyAIProvider';
 import { GeminiProvider } from '../providers/claudeProvider';
 import { meetingRepository, segmentRepository, analysisRepository } from '../repositories/meetingRepository';
 
@@ -12,6 +12,7 @@ interface MeetingStartMessage {
   meetingTitle?: string;
   audioMimeType?: string;
   sampleRate?: number;
+  audioSource?: 'mic' | 'tab';
 }
 
 interface MeetingStopMessage {
@@ -46,9 +47,10 @@ type ClientJsonMessage =
 interface SessionState {
   meetingId: string;
   startedAt: number;
-  deepgram: DeepgramProvider;
+  transcriber: AssemblyAIProvider;
   paused: boolean;
   stopping: boolean;
+  audioSource?: 'mic' | 'tab';
 }
 
 // ─── Send Helper ──────────────────────────────────────────────────────────────
@@ -60,7 +62,7 @@ function send(ws: WebSocket, data: object): void {
 }
 
 function sendError(ws: WebSocket, error: TranscriptionError | { code: string; message: string; recoverable: boolean }): void {
-  send(ws, { type: 'error', provider: 'deepgram', ...error });
+  send(ws, { type: 'error', provider: 'assemblyai', ...error });
 }
 
 // ─── Analysis Runner ──────────────────────────────────────────────────────────
@@ -131,7 +133,7 @@ export function handleWebSocketConnection(ws: WebSocket): void {
     if (isBinary) {
       if (!session || session.paused || session.stopping) return;
       const chunk = Buffer.isBuffer(data) ? data : Buffer.from(data as ArrayBuffer);
-      session.deepgram.sendAudio(chunk);
+      session.transcriber.sendAudio(chunk);
       return;
     }
 
@@ -149,7 +151,7 @@ export function handleWebSocketConnection(ws: WebSocket): void {
       case 'meeting:start': {
         if (session) {
           // Clean up any existing session first
-          session.deepgram.close();
+          session.transcriber.close();
           session = null;
         }
 
@@ -167,28 +169,34 @@ export function handleWebSocketConnection(ws: WebSocket): void {
         }
 
         // Connect Deepgram
-        const deepgram = new DeepgramProvider();
+        const transcriber = new AssemblyAIProvider();
 
-        deepgram.on('interim', (seg: TranscriptSegmentData) => {
+        transcriber.on('interim', (seg: TranscriptSegmentData) => {
+          let speaker = seg.speaker;
+          if (session?.audioSource === 'mic') speaker = 'Me';
+          
           send(ws, {
             type: 'transcription:interim',
             meetingId,
             segmentId: seg.segmentId,
             text: seg.text,
-            speaker: seg.speaker,
+            speaker: speaker,
             startTime: seg.startTime,
             endTime: seg.endTime,
             confidence: seg.confidence,
           });
         });
 
-        deepgram.on('final', (seg: TranscriptSegmentData) => {
+        transcriber.on('final', (seg: TranscriptSegmentData) => {
+          let speaker = seg.speaker;
+          if (session?.audioSource === 'mic') speaker = 'Me';
+
           // Persist idempotently
           const stableId = `${meetingId}-${seg.startTime.toFixed(3)}-${seg.endTime.toFixed(3)}`;
           segmentRepository.upsertById(stableId, {
             meetingId,
             text: seg.text,
-            speaker: seg.speaker,
+            speaker: speaker,
             startTime: seg.startTime,
             endTime: seg.endTime,
             confidence: seg.confidence,
@@ -199,15 +207,15 @@ export function handleWebSocketConnection(ws: WebSocket): void {
             meetingId,
             segmentId: stableId,
             text: seg.text,
-            speaker: seg.speaker,
+            speaker: speaker,
             startTime: seg.startTime,
             endTime: seg.endTime,
             confidence: seg.confidence,
           });
         });
 
-        deepgram.on('error', (err: TranscriptionError) => {
-          console.error('[Deepgram] Error:', err.code, err.message);
+        transcriber.on('error', (err: TranscriptionError) => {
+          console.error('[AssemblyAI] Error:', err.code, err.message);
           sendError(ws, err);
           if (!err.recoverable && session) {
             session.stopping = true;
@@ -215,15 +223,15 @@ export function handleWebSocketConnection(ws: WebSocket): void {
           }
         });
 
-        deepgram.on('disconnected', () => {
+        transcriber.on('disconnected', () => {
           send(ws, { type: 'transcription:status', status: 'disconnected', meetingId });
         });
 
         try {
-          await deepgram.connect(mimeType, sampleRate);
+          await transcriber.connect(undefined, sampleRate);
         } catch (err: any) {
           const errMsg = err?.message ?? 'Failed to connect to transcription service';
-          console.error('[Deepgram] Connection error:', errMsg);
+          console.error('[AssemblyAI] Connection error:', errMsg);
           sendError(ws, {
             code: 'TRANSCRIPTION_CONNECTION_FAILED',
             message: errMsg,
@@ -235,9 +243,10 @@ export function handleWebSocketConnection(ws: WebSocket): void {
         session = {
           meetingId,
           startedAt: Date.now(),
-          deepgram,
+          transcriber,
           paused: false,
           stopping: false,
+          audioSource: (message as MeetingStartMessage).audioSource,
         };
 
         send(ws, {
@@ -272,16 +281,16 @@ export function handleWebSocketConnection(ws: WebSocket): void {
         if (!session || session.stopping) break;
         session.stopping = true;
 
-        const { meetingId, deepgram, startedAt } = session;
+        const { meetingId, transcriber, startedAt } = session;
         const stopMsg = message as MeetingStopMessage;
         const durationSeconds = stopMsg.durationSeconds ?? Math.floor((Date.now() - startedAt) / 1000);
 
         send(ws, { type: 'transcription:status', status: 'finalizing', meetingId });
 
         // Finalize Deepgram stream
-        deepgram.finalize();
+        transcriber.finalize();
         await new Promise(resolve => setTimeout(resolve, 1500));
-        deepgram.close();
+        transcriber.close();
 
         // Complete meeting
         meetingRepository.complete(meetingId, durationSeconds);
@@ -309,11 +318,12 @@ export function handleWebSocketConnection(ws: WebSocket): void {
 
   ws.on('close', () => {
     if (session && !session.stopping) {
-      // Client disconnected unexpectedly — close Deepgram cleanly
+      // Client disconnected unexpectedly — complete the meeting so we don't lose the recording
       console.log(`[WS] Client disconnected during session ${session.meetingId}`);
-      session.deepgram.close();
+      session.transcriber.close();
       try {
-        meetingRepository.updateStatus(session.meetingId, 'failed');
+        const durationSeconds = Math.floor((Date.now() - session.startedAt) / 1000);
+        meetingRepository.complete(session.meetingId, durationSeconds);
       } catch (_) {}
     }
     session = null;
@@ -322,7 +332,7 @@ export function handleWebSocketConnection(ws: WebSocket): void {
   ws.on('error', (err) => {
     console.error('[WS] Socket error:', err.message);
     if (session) {
-      session.deepgram.close();
+      session.transcriber.close();
       session = null;
     }
   });

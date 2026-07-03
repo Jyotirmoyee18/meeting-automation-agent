@@ -19,7 +19,8 @@ export interface CaptureError {
 }
 
 interface UseTabCaptureOptions {
-  onChunk: (data: ArrayBuffer) => void;
+  onChunkTab: (data: ArrayBuffer) => void;
+  onChunkMic: (data: ArrayBuffer) => void;
   onStop: () => void;
   onError: (err: CaptureError) => void;
 }
@@ -28,43 +29,55 @@ interface UseTabCaptureReturn {
   captureState: CaptureState;
   mimeType: string | null;
   audioLevel: number;
+  sampleRate: number;
   startCapture: () => Promise<void>;
   pauseCapture: () => void;
   resumeCapture: () => void;
   stopCapture: () => void;
 }
 
-// Detect the best supported MIME type
-function getSupportedMimeType(): string {
-  const candidates = [
-    'audio/webm;codecs=opus',
-    'audio/webm',
-    'audio/ogg;codecs=opus',
-    'audio/mp4',
-  ];
-  for (const mime of candidates) {
-    if (MediaRecorder.isTypeSupported(mime)) return mime;
-  }
-  return '';
-}
-
 export function useTabCapture({
-  onChunk,
+  onChunkTab,
+  onChunkMic,
   onStop,
   onError,
 }: UseTabCaptureOptions): UseTabCaptureReturn {
   const [captureState, setCaptureState] = useState<CaptureState>('idle');
   const [mimeType, setMimeType] = useState<string | null>(null);
   const [audioLevel, setAudioLevel] = useState(0);
+  const [sampleRate, setSampleRate] = useState<number>(44100);
 
   const streamRef = useRef<MediaStream | null>(null);
-  const recorderRef = useRef<MediaRecorder | null>(null);
+  const micStreamRef = useRef<MediaStream | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
+  const tabScriptNodeRef = useRef<ScriptProcessorNode | null>(null);
+  const micScriptNodeRef = useRef<ScriptProcessorNode | null>(null);
+  const mediaStreamSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const micMediaStreamSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const animFrameRef = useRef<number | null>(null);
   const stoppingRef = useRef(false);
+  const pausedRef = useRef(false);
 
-  const cleanupVisualiser = () => {
+  const cleanupAudioNodes = () => {
+    if (tabScriptNodeRef.current) {
+      tabScriptNodeRef.current.disconnect();
+      tabScriptNodeRef.current.onaudioprocess = null;
+      tabScriptNodeRef.current = null;
+    }
+    if (micScriptNodeRef.current) {
+      micScriptNodeRef.current.disconnect();
+      micScriptNodeRef.current.onaudioprocess = null;
+      micScriptNodeRef.current = null;
+    }
+    if (mediaStreamSourceRef.current) {
+      mediaStreamSourceRef.current.disconnect();
+      mediaStreamSourceRef.current = null;
+    }
+    if (micMediaStreamSourceRef.current) {
+      micMediaStreamSourceRef.current.disconnect();
+      micMediaStreamSourceRef.current = null;
+    }
     if (animFrameRef.current) {
       cancelAnimationFrame(animFrameRef.current);
       animFrameRef.current = null;
@@ -80,52 +93,24 @@ export function useTabCapture({
   const cleanupStream = () => {
     streamRef.current?.getTracks().forEach(t => t.stop());
     streamRef.current = null;
+    micStreamRef.current?.getTracks().forEach(t => t.stop());
+    micStreamRef.current = null;
   };
 
   const cleanup = useCallback(() => {
-    cleanupVisualiser();
-    if (recorderRef.current && recorderRef.current.state !== 'inactive') {
-      try { recorderRef.current.stop(); } catch (_) {}
-    }
-    recorderRef.current = null;
+    cleanupAudioNodes();
     cleanupStream();
   }, []);
-
-  const startVisualiser = (stream: MediaStream) => {
-    try {
-      const ctx = new AudioContext();
-      audioCtxRef.current = ctx;
-      const src = ctx.createMediaStreamSource(stream);
-      const analyser = ctx.createAnalyser();
-      analyser.fftSize = 256;
-      src.connect(analyser);
-      analyserRef.current = analyser;
-
-      const tick = () => {
-        if (!analyserRef.current) return;
-        const data = new Uint8Array(analyserRef.current.frequencyBinCount);
-        analyserRef.current.getByteFrequencyData(data);
-        const avg = data.reduce((a, b) => a + b, 0) / data.length;
-        setAudioLevel(avg);
-        animFrameRef.current = requestAnimationFrame(tick);
-      };
-      tick();
-    } catch (e) {
-      console.warn('[useTabCapture] Visualiser error:', e);
-    }
-  };
 
   const handleStop = useCallback(() => {
     if (stoppingRef.current) return; // prevent duplicate
     stoppingRef.current = true;
-    cleanupVisualiser();
-    cleanupStream();
+    cleanup();
     setCaptureState('stopped');
     onStop();
-  }, [onStop]);
+  }, [onStop, cleanup]);
 
   const startCapture = useCallback(async () => {
-    // Browser support check
     if (!navigator.mediaDevices?.getDisplayMedia) {
       onError({
         code: 'UNSUPPORTED_BROWSER',
@@ -135,6 +120,7 @@ export function useTabCapture({
     }
 
     stoppingRef.current = false;
+    pausedRef.current = false;
     setCaptureState('requesting');
 
     let stream: MediaStream;
@@ -145,7 +131,7 @@ export function useTabCapture({
           echoCancellation: false,
           noiseSuppression: false,
           autoGainControl: false,
-          sampleRate: 48000,
+          sampleRate: 44100,
           channelCount: 1,
         },
         selfBrowserSurface: 'include',
@@ -162,10 +148,8 @@ export function useTabCapture({
       return;
     }
 
-    // Validate audio track
     const audioTracks = stream.getAudioTracks();
     if (audioTracks.length === 0) {
-      // Stop all tracks before failing
       stream.getTracks().forEach(t => t.stop());
       setCaptureState('error');
       onError({
@@ -176,16 +160,30 @@ export function useTabCapture({
     }
 
     streamRef.current = stream;
-    startVisualiser(stream);
 
-    // Detect track end (user stops sharing in browser UI)
+    let micStream: MediaStream | null = null;
+    try {
+      micStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          sampleRate: 44100,
+          channelCount: 1,
+        }
+      });
+      micStreamRef.current = micStream;
+    } catch (err: any) {
+      console.warn('Microphone access denied or failed', err);
+      // We can continue without mic if needed, or we could fail. We'll just continue.
+    }
+
     audioTracks[0].onended = () => {
       if (!stoppingRef.current) {
         handleStop();
       }
     };
 
-    // Also watch video track end
     const videoTracks = stream.getVideoTracks();
     if (videoTracks.length > 0) {
       videoTracks[0].onended = () => {
@@ -195,60 +193,98 @@ export function useTabCapture({
       };
     }
 
-    // Create MediaRecorder with best available MIME type
-    const mime = getSupportedMimeType();
-    const recorderOptions: MediaRecorderOptions = mime ? { mimeType: mime } : {};
-    setMimeType(mime || 'audio/webm');
+    setMimeType('audio/pcm');
 
-    // Use only the audio track for MediaRecorder to send only audio
-    const audioOnlyStream = new MediaStream(audioTracks);
-
-    let recorder: MediaRecorder;
     try {
-      recorder = new MediaRecorder(audioOnlyStream, recorderOptions);
+      const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)({
+        sampleRate: 44100,
+      });
+      setSampleRate(audioCtx.sampleRate);
+      audioCtxRef.current = audioCtx;
+
+      const source = audioCtx.createMediaStreamSource(new MediaStream(audioTracks));
+      mediaStreamSourceRef.current = source;
+
+      let micSource: MediaStreamAudioSourceNode | null = null;
+      if (micStreamRef.current) {
+        micSource = audioCtx.createMediaStreamSource(micStreamRef.current);
+        micMediaStreamSourceRef.current = micSource;
+      }
+
+      const analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 256;
+      source.connect(analyser);
+      if (micSource) {
+        micSource.connect(analyser);
+      }
+      analyserRef.current = analyser;
+
+      const convertToPCM = (e: AudioProcessingEvent) => {
+        const inputData = e.inputBuffer.getChannelData(0);
+        const pcm16 = new Int16Array(inputData.length);
+        for (let i = 0; i < inputData.length; i++) {
+          const s = Math.max(-1, Math.min(1, inputData[i]));
+          pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+        }
+        return pcm16.buffer;
+      };
+
+      const tabScriptNode = audioCtx.createScriptProcessor(4096, 1, 1);
+      tabScriptNodeRef.current = tabScriptNode;
+      source.connect(tabScriptNode);
+      const tabGain = audioCtx.createGain();
+      tabGain.gain.value = 0;
+      tabScriptNode.connect(tabGain);
+      tabGain.connect(audioCtx.destination);
+
+      tabScriptNode.onaudioprocess = (e) => {
+        if (stoppingRef.current || pausedRef.current) return;
+        onChunkTab(convertToPCM(e));
+      };
+
+      if (micSource) {
+        const micScriptNode = audioCtx.createScriptProcessor(4096, 1, 1);
+        micScriptNodeRef.current = micScriptNode;
+        micSource.connect(micScriptNode);
+        const micGain = audioCtx.createGain();
+        micGain.gain.value = 0;
+        micScriptNode.connect(micGain);
+        micGain.connect(audioCtx.destination);
+
+        micScriptNode.onaudioprocess = (e) => {
+          if (stoppingRef.current || pausedRef.current) return;
+          onChunkMic(convertToPCM(e));
+        };
+      }
+
+      const tick = () => {
+        if (!analyserRef.current) return;
+        const data = new Uint8Array(analyserRef.current.frequencyBinCount);
+        analyserRef.current.getByteFrequencyData(data);
+        const avg = data.reduce((a, b) => a + b, 0) / data.length;
+        setAudioLevel(avg);
+        animFrameRef.current = requestAnimationFrame(tick);
+      };
+      tick();
+
+      setCaptureState('active');
     } catch (err: any) {
       cleanup();
       setCaptureState('error');
-      onError({ code: 'MEDIARECORDER_ERROR', message: `Could not start MediaRecorder: ${err?.message}` });
-      return;
+      onError({ code: 'MEDIARECORDER_ERROR', message: `Could not start audio processing: ${err?.message}` });
     }
-
-    recorder.ondataavailable = (event) => {
-      if (event.data.size > 0) {
-        event.data.arrayBuffer().then(buf => onChunk(buf));
-      }
-    };
-
-    recorder.onerror = (event: any) => {
-      console.error('[MediaRecorder] Error:', event.error);
-      if (!stoppingRef.current) {
-        cleanup();
-        setCaptureState('error');
-        onError({ code: 'MEDIARECORDER_ERROR', message: `MediaRecorder error: ${event.error?.message ?? 'Unknown'}` });
-      }
-    };
-
-    recorder.onstop = () => {
-      if (!stoppingRef.current) {
-        handleStop();
-      }
-    };
-
-    recorderRef.current = recorder;
-    recorder.start(250); // 250ms chunks for low latency
-    setCaptureState('active');
-  }, [onChunk, onStop, onError, handleStop, cleanup]);
+  }, [onChunkTab, onChunkMic, onStop, onError, handleStop, cleanup]);
 
   const pauseCapture = useCallback(() => {
-    if (recorderRef.current?.state === 'recording') {
-      recorderRef.current.pause();
+    if (!pausedRef.current && !stoppingRef.current) {
+      pausedRef.current = true;
       setCaptureState('paused');
     }
   }, []);
 
   const resumeCapture = useCallback(() => {
-    if (recorderRef.current?.state === 'paused') {
-      recorderRef.current.resume();
+    if (pausedRef.current && !stoppingRef.current) {
+      pausedRef.current = false;
       setCaptureState('active');
     }
   }, []);
@@ -256,9 +292,6 @@ export function useTabCapture({
   const stopCapture = useCallback(() => {
     if (stoppingRef.current) return;
     stoppingRef.current = true;
-    if (recorderRef.current && recorderRef.current.state !== 'inactive') {
-      recorderRef.current.stop();
-    }
     cleanup();
     setCaptureState('stopped');
   }, [cleanup]);
@@ -267,6 +300,7 @@ export function useTabCapture({
     captureState,
     mimeType,
     audioLevel,
+    sampleRate,
     startCapture,
     pauseCapture,
     resumeCapture,

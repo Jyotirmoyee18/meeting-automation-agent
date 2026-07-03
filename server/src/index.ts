@@ -10,7 +10,7 @@ dotenv.config();
 
 // ─── Environment Validation ───────────────────────────────────────────────────
 
-const REQUIRED_ENV: string[] = ["DEEPGRAM_API_KEY", "GEMINI_API_KEY"];
+const REQUIRED_ENV: string[] = ["ASSEMBLYAI_API_KEY", "GEMINI_API_KEY"];
 const missing = REQUIRED_ENV.filter((k) => !process.env[k]);
 if (missing.length > 0) {
   console.error(

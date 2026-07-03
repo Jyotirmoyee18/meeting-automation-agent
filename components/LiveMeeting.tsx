@@ -36,9 +36,16 @@ const SPEAKER_COLORS = [
   'bg-cyan-100 text-cyan-800 border-cyan-200',
 ];
 
-function speakerColor(speaker: number | null): string {
+function speakerColor(speaker: number | string | null): string {
   if (speaker === null) return 'bg-slate-100 text-slate-700 border-slate-200';
-  return SPEAKER_COLORS[speaker % SPEAKER_COLORS.length];
+  let idx = 0;
+  if (typeof speaker === 'number') {
+    idx = speaker;
+  } else if (typeof speaker === 'string' && speaker.length > 0) {
+    idx = speaker.charCodeAt(0) - 65;
+    if (isNaN(idx) || idx < 0) idx = 0;
+  }
+  return SPEAKER_COLORS[idx % SPEAKER_COLORS.length];
 }
 
 // ─── Connection Status Badge ──────────────────────────────────────────────────
@@ -47,6 +54,7 @@ function ConnectionBadge({ state }: { state: ConnectionState }) {
   const map: Record<ConnectionState, { label: string; cls: string; dot: string }> = {
     idle:        { label: 'Disconnected',  cls: 'bg-slate-100 text-slate-600', dot: 'bg-slate-400' },
     connecting:  { label: 'Connecting…',  cls: 'bg-amber-100 text-amber-700', dot: 'bg-amber-500 animate-pulse' },
+    disconnected:{ label: 'Disconnected', cls: 'bg-slate-100 text-slate-600', dot: 'bg-slate-400' },
     connected:   { label: 'Connected',    cls: 'bg-sky-100 text-sky-700',     dot: 'bg-sky-500' },
     recording:   { label: 'Recording',    cls: 'bg-red-100 text-red-700',     dot: 'bg-red-500 animate-pulse' },
     paused:      { label: 'Paused',       cls: 'bg-amber-100 text-amber-700', dot: 'bg-amber-400' },
@@ -104,18 +112,22 @@ const LiveMeeting: React.FC = () => {
 
   const elapsedRef = useRef(0);
   const elapsedIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const wsRef = useWebSocket();
+  const wsRefTab = useWebSocket();
+  const wsRefMic = useWebSocket();
   const { segments, interimText, scrollRef, addFinalSegment, setInterimText, clearAll } = useTranscript();
 
   // ── WS message handler ─────────────────────────────────────────────────────
   useEffect(() => {
-    const off = wsRef.onMessage((msg: WsServerMessage) => {
+    const handleMessage = (msg: WsServerMessage) => {
       switch (msg.type) {
         case 'connection:ready':
           break;
 
         case 'transcription:status':
           setConnectionState(msg.status);
+          if (msg.status === 'completed') {
+            setTimeout(() => navigate(`/meetings/${msg.meetingId}`), 1000);
+          }
           break;
 
         case 'transcription:interim':
@@ -142,7 +154,6 @@ const LiveMeeting: React.FC = () => {
         case 'meeting:analysis-completed':
           setAnalysisState(msg.status === 'completed' ? 'completed' : 'failed');
           if (msg.status === 'failed') setAnalysisError(msg.error ?? 'Analysis failed');
-          // Navigate to details after a short delay
           setTimeout(() => navigate(`/meeting/${meetingId}/details`), 1500);
           break;
 
@@ -160,14 +171,24 @@ const LiveMeeting: React.FC = () => {
           }
           break;
       }
-    });
-    return off;
-  }, [wsRef, addFinalSegment, setInterimText, navigate, meetingId]);
+    };
+
+    const offTab = wsRefTab.onMessage(handleMessage);
+    const offMic = wsRefMic.onMessage(handleMessage);
+    return () => {
+      offTab();
+      offMic();
+    };
+  }, [wsRefTab, wsRefMic, addFinalSegment, setInterimText, navigate, meetingId]);
 
   // ── Tab capture ────────────────────────────────────────────────────────────
-  const handleChunk = useCallback((data: ArrayBuffer) => {
-    wsRef.sendBinary(data);
-  }, [wsRef]);
+  const handleChunkTab = useCallback((data: ArrayBuffer) => {
+    wsRefTab.sendBinary(data);
+  }, [wsRefTab]);
+
+  const handleChunkMic = useCallback((data: ArrayBuffer) => {
+    wsRefMic.sendBinary(data);
+  }, [wsRefMic]);
 
   const handleCaptureStop = useCallback(() => {
     // Track ended — finalize
@@ -182,15 +203,17 @@ const LiveMeeting: React.FC = () => {
   }, []);
 
   const {
-    captureState,
-    mimeType,
-    audioLevel,
     startCapture,
     pauseCapture,
     resumeCapture,
     stopCapture,
+    captureState,
+    audioLevel,
+    mimeType,
+    sampleRate,
   } = useTabCapture({
-    onChunk: handleChunk,
+    onChunkTab: handleChunkTab,
+    onChunkMic: handleChunkMic,
     onStop: handleCaptureStop,
     onError: handleCaptureError,
   });
@@ -221,7 +244,8 @@ const LiveMeeting: React.FC = () => {
     setAnalysisState('idle');
     clearAll();
 
-    wsRef.connect();
+    wsRefTab.connect();
+    wsRefMic.connect();
 
     // Wait for WS open before starting capture
     await new Promise<void>(resolve => {
@@ -240,12 +264,22 @@ const LiveMeeting: React.FC = () => {
     if (captureError) return; // capture failed
 
     // Send meeting:start
-    wsRef.sendJson({
+    wsRefTab.sendJson({
       type: 'meeting:start',
       meetingId,
       meetingTitle: meetingTitle,
       audioMimeType: mimeType ?? 'audio/webm;codecs=opus',
-      sampleRate: 48000,
+      sampleRate,
+      audioSource: 'tab'
+    });
+
+    wsRefMic.sendJson({
+      type: 'meeting:start',
+      meetingId,
+      meetingTitle: meetingTitle,
+      audioMimeType: mimeType ?? 'audio/webm;codecs=opus',
+      sampleRate,
+      audioSource: 'mic'
     });
 
     setConnectionState('recording');
@@ -262,28 +296,36 @@ const LiveMeeting: React.FC = () => {
   const stopMeeting = useCallback(() => {
     stopEverything();
     setConnectionState('finalizing');
-    wsRef.sendJson({
+    wsRefTab.sendJson({
       type: 'meeting:stop',
       meetingId,
       durationSeconds: elapsedRef.current,
     });
-  }, [stopEverything, wsRef, meetingId]);
+    wsRefMic.sendJson({
+      type: 'meeting:stop',
+      meetingId,
+      durationSeconds: elapsedRef.current,
+    });
+  }, [stopEverything, wsRefTab, wsRefMic, meetingId]);
 
   // ── Pause / Resume ─────────────────────────────────────────────────────────
   const pauseMeeting = () => {
     pauseCapture();
-    wsRef.sendJson({ type: 'meeting:pause', meetingId });
+    wsRefTab.sendJson({ type: 'meeting:pause', meetingId });
+    wsRefMic.sendJson({ type: 'meeting:pause', meetingId });
     setConnectionState('paused');
   };
 
   const resumeMeeting = () => {
     resumeCapture();
-    wsRef.sendJson({ type: 'meeting:resume', meetingId });
+    wsRefTab.sendJson({ type: 'meeting:resume', meetingId });
+    wsRefMic.sendJson({ type: 'meeting:resume', meetingId });
     setConnectionState('recording');
   };
 
   // ── Title save ─────────────────────────────────────────────────────────────
   const saveTitleToServer = async (title: string) => {
+    if (connectionState === 'idle') return; // Meeting not created in DB yet
     try {
       await fetch(`/api/meetings/${meetingId}`, {
         method: 'PATCH',
@@ -298,8 +340,8 @@ const LiveMeeting: React.FC = () => {
     saveTitleToServer(meetingTitle);
   };
 
-  const isFinalizing = connectionState === 'finalizing' || connectionState === 'completed';
-  const isRecording = connectionState === 'recording';
+  const isFinalizing = connectionState === 'finalizing' || connectionState === 'completed' || connectionState === 'error';
+  const isRecording = connectionState === 'recording' || connectionState === 'connected';
   const isPaused = connectionState === 'paused';
   const canStop = isRecording || isPaused;
   const canPause = isRecording;
@@ -469,7 +511,11 @@ const LiveMeeting: React.FC = () => {
                 <div key={seg.id} className="flex flex-col items-start">
                   <div className="flex items-center gap-2 mb-1 px-1">
                     <span className={`text-[10px] font-black uppercase tracking-widest px-2 py-0.5 rounded-full border ${speakerColor(seg.speaker)}`}>
-                      {seg.speaker !== null ? `Speaker ${seg.speaker + 1}` : 'Speaker'}
+                      {seg.speaker !== null 
+                        ? (typeof seg.speaker === 'number' 
+                            ? `Speaker ${seg.speaker + 1}` 
+                            : (seg.speaker === 'Me' ? 'Me' : `Speaker ${seg.speaker}`))
+                        : 'Speaker'}
                     </span>
                     {seg.startTime !== null && (
                       <span className="text-[10px] text-slate-400 font-mono">

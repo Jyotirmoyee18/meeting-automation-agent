@@ -18,6 +18,7 @@ export type ConnectionState =
   | 'reconnecting'
   | 'finalizing'
   | 'completed'
+  | 'disconnected'
   | 'error';
 
 // ─── Legacy types (preserved for compatibility) ───────────────────────────────
@@ -124,6 +125,7 @@ export interface WsMeetingStartMsg {
   meetingTitle: string;
   audioMimeType: string;
   sampleRate?: number;
+  audioSource?: 'mic' | 'tab';
 }
 
 export interface WsAudioChunkMsg {

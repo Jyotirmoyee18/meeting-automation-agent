@@ -11,7 +11,7 @@
   },
   "dependencies": {
     "@google/genai": "^1.34.0",
-    "@deepgram/sdk": "^3.9.0",
+    "assemblyai": "^4.8.0",
     "better-sqlite3": "^11.6.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",

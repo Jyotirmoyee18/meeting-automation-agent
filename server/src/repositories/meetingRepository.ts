@@ -18,7 +18,7 @@ export interface TranscriptSegmentRow {
   id: string;
   meeting_id: string;
   text: string;
-  speaker: number | null;
+  speaker: number | string | null;
   start_time: number | null;
   end_time: number | null;
   confidence: number | null;
@@ -98,7 +98,7 @@ export const segmentRepository = {
   insert(segment: {
     meetingId: string;
     text: string;
-    speaker?: number | null;
+    speaker?: number | string | null;
     startTime?: number | null;
     endTime?: number | null;
     confidence?: number | null;
@@ -123,7 +123,7 @@ export const segmentRepository = {
   upsertById(id: string, segment: {
     meetingId: string;
     text: string;
-    speaker?: number | null;
+    speaker?: number | string | null;
     startTime?: number | null;
     endTime?: number | null;
     confidence?: number | null;
