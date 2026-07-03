@@ -1,46 +1,40 @@
-
 import React from 'react';
-import { MeetingStatus } from '../types';
+import { useNavigate, useLocation } from 'react-router-dom';
 
-interface HeaderProps {
-  status: MeetingStatus;
-  onStart: () => void;
-}
+const Header: React.FC = () => {
+  const navigate = useNavigate();
+  const location = useLocation();
+  const isOnNew = location.pathname === '/meeting/new' || (location.pathname.startsWith('/meeting/') && !location.pathname.endsWith('/details'));
 
-const Header: React.FC<HeaderProps> = ({ status, onStart }) => {
   return (
-    <header className="h-20 border-b border-slate-200 bg-white px-8 flex items-center justify-between sticky top-0 z-10">
+    <header className="h-16 border-b border-slate-200 bg-white px-8 flex items-center justify-between flex-shrink-0">
       <div className="flex items-center gap-3">
-        <h1 className="text-xl font-bold text-slate-800">VoxNote AI</h1>
-        {status === MeetingStatus.LISTENING && (
-          <div className="flex items-center gap-2 px-3 py-1 bg-red-100 rounded-full">
-            <span className="w-2 h-2 bg-red-500 rounded-full animate-pulse"></span>
-            <span className="text-xs font-semibold text-red-600 uppercase tracking-wider">Live Transcription</span>
+        <div
+          className="flex items-center gap-2 cursor-pointer"
+          onClick={() => navigate('/')}
+        >
+          <div className="w-8 h-8 bg-gradient-to-br from-indigo-500 to-purple-600 rounded-lg flex items-center justify-center">
+            <i className="fas fa-wave-square text-white text-sm" />
           </div>
-        )}
-        {status === MeetingStatus.PROCESSING && (
-          <div className="flex items-center gap-2 px-3 py-1 bg-amber-100 rounded-full">
-            <span className="w-2 h-2 bg-amber-500 rounded-full animate-bounce"></span>
-            <span className="text-xs font-semibold text-amber-600 uppercase tracking-wider">Analyzing Context</span>
-          </div>
-        )}
+          <h1 className="text-lg font-bold text-slate-800">VoxNote AI</h1>
+        </div>
       </div>
 
       <div className="flex items-center gap-4">
-        {status === MeetingStatus.COMPLETED && (
-          <button 
-            onClick={onStart}
-            className="flex items-center gap-2 px-4 py-2 border border-slate-200 rounded-lg hover:bg-slate-50 transition-colors text-slate-600 font-medium"
+        {!isOnNew && (
+          <button
+            id="header-new-btn"
+            onClick={() => navigate('/meeting/new')}
+            className="flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-sm font-bold transition-all shadow-sm"
           >
-            <i className="fas fa-plus"></i>
-            New Session
+            <i className="fas fa-plus" />
+            New
           </button>
         )}
         <div className="flex items-center gap-2">
-          <div className="w-8 h-8 rounded-full bg-slate-200 flex items-center justify-center">
-            <i className="fas fa-user text-slate-500 text-sm"></i>
+          <div className="w-8 h-8 rounded-full bg-gradient-to-br from-slate-200 to-slate-300 flex items-center justify-center">
+            <i className="fas fa-user text-slate-500 text-sm" />
           </div>
-          <span className="text-sm font-medium text-slate-700">Team Agent</span>
         </div>
       </div>
     </header>

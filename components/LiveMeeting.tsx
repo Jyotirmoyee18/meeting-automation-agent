@@ -1,386 +1,587 @@
-import React, { useEffect, useRef, useState } from 'react';
-import { TranscriptionEntry } from '../types';
+import React, { useEffect, useState, useRef, useCallback } from 'react';
+import { useNavigate, useParams } from 'react-router-dom';
+import { v4 as uuidv4 } from 'uuid';
+import { useWebSocket } from '../hooks/useWebSocket';
+import { useTabCapture } from '../hooks/useTabCapture';
+import { useTranscript } from '../hooks/useTranscript';
+import {
+  ConnectionState,
+  WsServerMessage,
+  TranscriptSegment,
+  AppError,
+} from '../types';
 
-interface LiveMeetingProps {
-  transcripts: TranscriptionEntry[];
-  onAddTranscript: (entry: TranscriptionEntry) => void;
-  onStop: (fullTranscript: string) => void;
-  isProcessing: boolean;
-  meetingLink?: string;
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function formatElapsed(seconds: number): string {
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = seconds % 60;
+  if (h > 0) return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+  return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
 }
 
-const LiveMeeting: React.FC<LiveMeetingProps> = ({
-  transcripts,
-  onAddTranscript,
-  onStop,
-  isProcessing,
-  meetingLink,
-}) => {
-  const scrollRef = useRef<HTMLDivElement>(null);
-  const [isBotConnected, setIsBotConnected] = useState(false);
-  const [audioLevel, setAudioLevel] = useState(0);
-  const [manualText, setManualText] = useState('');
-  const [captureMode, setCaptureMode] = useState<'mic' | 'display+mic' | 'starting'>('starting');
-  const [segmentCount, setSegmentCount] = useState(0);
-  const [status, setStatus] = useState('Initializing...');
+function formatTimestamp(sec: number | null): string {
+  if (sec === null) return '';
+  const m = Math.floor(sec / 60);
+  const s = Math.floor(sec % 60);
+  return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+}
 
-  // ── Refs ───────────────────────────────────────────────────────────────────
-  const audioContextRef    = useRef<AudioContext | null>(null);
-  const displayStreamRef   = useRef<MediaStream | null>(null);
-  const micStreamRef       = useRef<MediaStream | null>(null);
-  const recognitionRef     = useRef<any>(null);
-  const animationFrameRef  = useRef<number | null>(null);
-  const audioElementRef    = useRef<HTMLAudioElement | null>(null);
+const SPEAKER_COLORS = [
+  'bg-indigo-100 text-indigo-800 border-indigo-200',
+  'bg-emerald-100 text-emerald-800 border-emerald-200',
+  'bg-amber-100 text-amber-800 border-amber-200',
+  'bg-rose-100 text-rose-800 border-rose-200',
+  'bg-cyan-100 text-cyan-800 border-cyan-200',
+];
 
-  // The ONE source of truth for collected speech — a plain ref, written
-  // synchronously in onresult, read synchronously in stopListening.
-  // Never depends on React state or props.
-  const accRef = useRef<string[]>([]);
+function speakerColor(speaker: number | null): string {
+  if (speaker === null) return 'bg-slate-100 text-slate-700 border-slate-200';
+  return SPEAKER_COLORS[speaker % SPEAKER_COLORS.length];
+}
 
-  // A ref that mirrors the mic stream — recognition restarts only while
-  // this stream is alive (tracks are not ended). Immune to StrictMode.
-  const activeRef = useRef(false);
+// ─── Connection Status Badge ──────────────────────────────────────────────────
 
-  // Stable ref to onAddTranscript so closures never go stale
-  const emitRef = useRef(onAddTranscript);
-  useEffect(() => { emitRef.current = onAddTranscript; }, [onAddTranscript]);
+function ConnectionBadge({ state }: { state: ConnectionState }) {
+  const map: Record<ConnectionState, { label: string; cls: string; dot: string }> = {
+    idle:        { label: 'Disconnected',  cls: 'bg-slate-100 text-slate-600', dot: 'bg-slate-400' },
+    connecting:  { label: 'Connecting…',  cls: 'bg-amber-100 text-amber-700', dot: 'bg-amber-500 animate-pulse' },
+    connected:   { label: 'Connected',    cls: 'bg-sky-100 text-sky-700',     dot: 'bg-sky-500' },
+    recording:   { label: 'Recording',    cls: 'bg-red-100 text-red-700',     dot: 'bg-red-500 animate-pulse' },
+    paused:      { label: 'Paused',       cls: 'bg-amber-100 text-amber-700', dot: 'bg-amber-400' },
+    reconnecting:{ label: 'Reconnecting…',cls: 'bg-orange-100 text-orange-700',dot: 'bg-orange-500 animate-pulse' },
+    finalizing:  { label: 'Finalizing…', cls: 'bg-purple-100 text-purple-700',dot: 'bg-purple-500 animate-pulse' },
+    completed:   { label: 'Completed',    cls: 'bg-emerald-100 text-emerald-700',dot: 'bg-emerald-500' },
+    error:       { label: 'Error',        cls: 'bg-red-100 text-red-700',     dot: 'bg-red-500' },
+  };
+  const s = map[state];
+  return (
+    <span className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold uppercase tracking-wider ${s.cls}`}>
+      <span className={`w-2 h-2 rounded-full ${s.dot}`} />
+      {s.label}
+    </span>
+  );
+}
 
-  const emit = (entry: TranscriptionEntry) => emitRef.current(entry);
+// ─── Audio Level Visualiser ───────────────────────────────────────────────────
 
+function AudioBars({ level, active }: { level: number; active: boolean }) {
+  return (
+    <div className="flex items-end gap-0.5 h-5">
+      {[0.3, 0.6, 1.0, 0.7, 0.4, 0.8, 0.5].map((factor, i) => {
+        const h = active ? Math.max(4, (level / 128) * 20 * factor) : 3;
+        return (
+          <div
+            key={i}
+            className={`w-1 rounded-full transition-all duration-75 ${active ? 'bg-indigo-500' : 'bg-slate-300'}`}
+            style={{ height: `${h}px` }}
+          />
+        );
+      })}
+    </div>
+  );
+}
+
+// ─── Component ────────────────────────────────────────────────────────────────
+
+const LiveMeeting: React.FC = () => {
+  const { id } = useParams<{ id: string }>();
+  const navigate = useNavigate();
+
+  const meetingIdRef = useRef<string>(id === 'new' ? uuidv4() : (id ?? uuidv4()));
+  const meetingId = meetingIdRef.current;
+
+  const [meetingTitle, setMeetingTitle] = useState('Untitled Meeting');
+  const [editingTitle, setEditingTitle] = useState(false);
+  const [connectionState, setConnectionState] = useState<ConnectionState>('idle');
+  const [appError, setAppError] = useState<AppError | null>(null);
+  const [captureError, setCaptureError] = useState<string | null>(null);
+  const [analysisState, setAnalysisState] = useState<'idle' | 'running' | 'completed' | 'failed'>('idle');
+  const [analysisError, setAnalysisError] = useState<string | null>(null);
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  const [started, setStarted] = useState(false);
+
+  const elapsedRef = useRef(0);
+  const elapsedIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const wsRef = useWebSocket();
+  const { segments, interimText, scrollRef, addFinalSegment, setInterimText, clearAll } = useTranscript();
+
+  // ── WS message handler ─────────────────────────────────────────────────────
   useEffect(() => {
-    if (scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-    }
-  }, [transcripts]);
+    const off = wsRef.onMessage((msg: WsServerMessage) => {
+      switch (msg.type) {
+        case 'connection:ready':
+          break;
 
-  // ── Visualiser ─────────────────────────────────────────────────────────────
-  const startVisualiser = (stream: MediaStream) => {
-    try {
-      const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
-      audioContextRef.current = ctx;
-      const src = ctx.createMediaStreamSource(stream);
-      const analyser = ctx.createAnalyser();
-      analyser.fftSize = 256;
-      src.connect(analyser);
-      const tick = () => {
-        const d = new Uint8Array(analyser.frequencyBinCount);
-        analyser.getByteFrequencyData(d);
-        setAudioLevel(d.reduce((a, b) => a + b, 0) / d.length);
-        animationFrameRef.current = requestAnimationFrame(tick);
-      };
-      tick();
-    } catch (e) {
-      console.warn('Visualiser error', e);
-    }
-  };
+        case 'transcription:status':
+          setConnectionState(msg.status);
+          break;
 
-  // ── Speech Recognition ─────────────────────────────────────────────────────
-  // Keyed to the mic stream itself — restarts as long as the stream is live.
-  const startRecognition = (micStream: MediaStream) => {
-    const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-    if (!SR) {
-      emit({ speaker: 'System', text: 'ERROR: Use Chrome or Edge — Speech Recognition not supported here.', timestamp: new Date() });
-      setStatus('Not supported');
-      return;
-    }
+        case 'transcription:interim':
+          setInterimText(msg.text);
+          break;
 
-    // Stop any previous instance cleanly
-    if (recognitionRef.current) {
-      try { recognitionRef.current._noRestart = true; recognitionRef.current.stop(); } catch (_) {}
-      recognitionRef.current = null;
-    }
-
-    const rec = new SR();
-    rec.continuous    = true;
-    rec.interimResults = true;
-    rec.lang          = 'en-US';
-    rec._noRestart    = false;
-
-    rec.onstart = () => {
-      setStatus('Listening — speak now');
-    };
-
-    rec.onresult = (event: any) => {
-      for (let i = event.resultIndex; i < event.results.length; i++) {
-        if (event.results[i].isFinal) {
-          const text = event.results[i][0].transcript.trim();
-          if (!text) continue;
-          accRef.current.push(text);
-          setSegmentCount(c => c + 1);
-          emit({ speaker: 'Speaker', text, timestamp: new Date() });
-        }
-      }
-    };
-
-    // Restart only if the mic stream is still alive and we didn't call stop() ourselves
-    rec.onend = () => {
-      if (rec._noRestart) return;
-      const streamAlive = micStream.getTracks().some(t => t.readyState === 'live');
-      if (streamAlive && activeRef.current) {
-        setStatus('Restarting recognition...');
-        try { rec.start(); } catch (_) {}
-      } else {
-        setStatus('Recognition stopped');
-      }
-    };
-
-    rec.onerror = (e: any) => {
-      if (e.error === 'no-speech') { setStatus('No speech detected — keep talking'); return; }
-      if (e.error === 'aborted')   return; // normal during stop()
-      setStatus(`Error: ${e.error}`);
-      if (e.error === 'not-allowed') {
-        emit({ speaker: 'System', text: 'Microphone permission denied. Allow mic access and refresh.', timestamp: new Date() });
-      }
-      if (e.error === 'audio-capture') {
-        emit({ speaker: 'System', text: 'No microphone detected. Connect a mic and refresh.', timestamp: new Date() });
-      }
-    };
-
-    rec.start();
-    recognitionRef.current = rec;
-  };
-
-  // ── Main start ─────────────────────────────────────────────────────────────
-  const startListening = async () => {
-    // Guard against StrictMode double-invoke — if already active, skip
-    if (activeRef.current) return;
-    activeRef.current = true;
-    accRef.current = [];
-    setSegmentCount(0);
-    setStatus('Requesting microphone...');
-
-    try {
-      const micStream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true, sampleRate: 16000 },
-        video: false,
-      });
-      micStreamRef.current = micStream;
-      setStatus('Mic granted — starting recognition...');
-
-      startVisualiser(micStream);
-      startRecognition(micStream);
-      setIsBotConnected(true);
-
-      if (meetingLink) {
-        emit({ speaker: 'System', text: 'In the share popup → tick "Share tab audio" → pick your meeting tab.', timestamp: new Date() });
-        try {
-          const displayStream = await (navigator.mediaDevices as any).getDisplayMedia({
-            video: true,
-            audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+        case 'transcription:final':
+          addFinalSegment({
+            id: msg.segmentId,
+            meetingId: msg.meetingId,
+            text: msg.text,
+            speaker: msg.speaker,
+            startTime: msg.startTime,
+            endTime: msg.endTime,
+            confidence: msg.confidence,
+            isFinal: true,
           });
-          displayStreamRef.current = displayStream;
+          break;
 
-          if (audioElementRef.current) {
-            audioElementRef.current.srcObject = displayStream;
-            audioElementRef.current.volume = 1.0;
-            audioElementRef.current.muted = false;
-            await audioElementRef.current.play().catch(() => {});
+        case 'meeting:analysis-started':
+          setAnalysisState('running');
+          break;
+
+        case 'meeting:analysis-completed':
+          setAnalysisState(msg.status === 'completed' ? 'completed' : 'failed');
+          if (msg.status === 'failed') setAnalysisError(msg.error ?? 'Analysis failed');
+          // Navigate to details after a short delay
+          setTimeout(() => navigate(`/meeting/${meetingId}/details`), 1500);
+          break;
+
+        case 'error':
+          setAppError({
+            type: 'error',
+            code: msg.code,
+            message: msg.message,
+            recoverable: msg.recoverable,
+            provider: msg.provider,
+          });
+          if (!msg.recoverable) {
+            setConnectionState('error');
+            stopEverything();
           }
-
-          setCaptureMode('display+mic');
-          emit({ speaker: 'System', text: 'Meeting audio playing through speakers — mic is transcribing', timestamp: new Date() });
-        } catch {
-          setCaptureMode('mic');
-          emit({ speaker: 'System', text: 'Screen share skipped — mic-only mode. Speak and your words will appear.', timestamp: new Date() });
-        }
-      } else {
-        setCaptureMode('mic');
-        emit({ speaker: 'System', text: 'Mic live — start speaking and your words will appear below.', timestamp: new Date() });
+          break;
       }
-    } catch (err: any) {
-      activeRef.current = false;
-      setIsBotConnected(false);
-      setStatus(`Failed: ${err.message}`);
-      emit({ speaker: 'System', text: `Could not start mic: ${err.message}`, timestamp: new Date() });
+    });
+    return off;
+  }, [wsRef, addFinalSegment, setInterimText, navigate, meetingId]);
+
+  // ── Tab capture ────────────────────────────────────────────────────────────
+  const handleChunk = useCallback((data: ArrayBuffer) => {
+    wsRef.sendBinary(data);
+  }, [wsRef]);
+
+  const handleCaptureStop = useCallback(() => {
+    // Track ended — finalize
+    if (connectionState === 'recording' || connectionState === 'paused') {
+      stopMeeting();
     }
-  };
+  }, [connectionState]);
 
-  // ── Stop ───────────────────────────────────────────────────────────────────
-  const stopListening = () => {
-    activeRef.current = false;
-    setIsBotConnected(false);
-
-    if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
-
-    // Stop recognition cleanly (flag prevents onend restart)
-    if (recognitionRef.current) {
-      recognitionRef.current._noRestart = true;
-      try { recognitionRef.current.stop(); } catch (_) {}
-    }
-
-    micStreamRef.current?.getTracks().forEach(t => t.stop());
-    displayStreamRef.current?.getTracks().forEach(t => t.stop());
-    audioContextRef.current?.close().catch(() => {});
-    if (audioElementRef.current) audioElementRef.current.srcObject = null;
-
-    const speechText = accRef.current.join(' ').trim();
-    const finalTranscript = speechText || manualText.trim();
-    onStop(finalTranscript || '[No speech detected — session ended]');
-  };
-
-  // ── Manual add ─────────────────────────────────────────────────────────────
-  const handleManualAdd = () => {
-    const text = manualText.trim();
-    if (!text) return;
-    accRef.current.push(text);
-    setSegmentCount(c => c + 1);
-    emit({ speaker: 'Speaker', text, timestamp: new Date() });
-    setManualText('');
-  };
-
-  // ── Mount — StrictMode safe ────────────────────────────────────────────────
-  useEffect(() => {
-    startListening();
-    return () => {
-      // On StrictMode unmount: stop everything and reset active flag
-      activeRef.current = false;
-      if (recognitionRef.current) {
-        recognitionRef.current._noRestart = true;
-        try { recognitionRef.current.stop(); } catch (_) {}
-      }
-      micStreamRef.current?.getTracks().forEach(t => t.stop());
-      displayStreamRef.current?.getTracks().forEach(t => t.stop());
-      audioContextRef.current?.close().catch(() => {});
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+  const handleCaptureError = useCallback((err: { message: string }) => {
+    setCaptureError(err.message);
+    setConnectionState('error');
   }, []);
 
-  // ── Render ─────────────────────────────────────────────────────────────────
+  const {
+    captureState,
+    mimeType,
+    audioLevel,
+    startCapture,
+    pauseCapture,
+    resumeCapture,
+    stopCapture,
+  } = useTabCapture({
+    onChunk: handleChunk,
+    onStop: handleCaptureStop,
+    onError: handleCaptureError,
+  });
+
+  // ── Timer ──────────────────────────────────────────────────────────────────
+  const startTimer = () => {
+    elapsedRef.current = 0;
+    setElapsedSeconds(0);
+    elapsedIntervalRef.current = setInterval(() => {
+      elapsedRef.current += 1;
+      setElapsedSeconds(elapsedRef.current);
+    }, 1000);
+  };
+
+  const stopTimer = () => {
+    if (elapsedIntervalRef.current) {
+      clearInterval(elapsedIntervalRef.current);
+      elapsedIntervalRef.current = null;
+    }
+  };
+
+  useEffect(() => () => stopTimer(), []);
+
+  // ── Start flow ─────────────────────────────────────────────────────────────
+  const startMeeting = async () => {
+    setAppError(null);
+    setCaptureError(null);
+    setAnalysisState('idle');
+    clearAll();
+
+    wsRef.connect();
+
+    // Wait for WS open before starting capture
+    await new Promise<void>(resolve => {
+      const check = setInterval(() => {
+        // Check via a direct ping — the connection:ready event will have set state
+        if (connectionState === 'connected' || connectionState === 'recording') {
+          clearInterval(check);
+          resolve();
+        }
+      }, 100);
+      setTimeout(() => { clearInterval(check); resolve(); }, 3000);
+    });
+
+    // Start capture
+    await startCapture();
+    if (captureError) return; // capture failed
+
+    // Send meeting:start
+    wsRef.sendJson({
+      type: 'meeting:start',
+      meetingId,
+      meetingTitle: meetingTitle,
+      audioMimeType: mimeType ?? 'audio/webm;codecs=opus',
+      sampleRate: 48000,
+    });
+
+    setConnectionState('recording');
+    setStarted(true);
+    startTimer();
+  };
+
+  // ── Stop flow ──────────────────────────────────────────────────────────────
+  const stopEverything = useCallback(() => {
+    stopCapture();
+    stopTimer();
+  }, [stopCapture]);
+
+  const stopMeeting = useCallback(() => {
+    stopEverything();
+    setConnectionState('finalizing');
+    wsRef.sendJson({
+      type: 'meeting:stop',
+      meetingId,
+      durationSeconds: elapsedRef.current,
+    });
+  }, [stopEverything, wsRef, meetingId]);
+
+  // ── Pause / Resume ─────────────────────────────────────────────────────────
+  const pauseMeeting = () => {
+    pauseCapture();
+    wsRef.sendJson({ type: 'meeting:pause', meetingId });
+    setConnectionState('paused');
+  };
+
+  const resumeMeeting = () => {
+    resumeCapture();
+    wsRef.sendJson({ type: 'meeting:resume', meetingId });
+    setConnectionState('recording');
+  };
+
+  // ── Title save ─────────────────────────────────────────────────────────────
+  const saveTitleToServer = async (title: string) => {
+    try {
+      await fetch(`/api/meetings/${meetingId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title }),
+      });
+    } catch (_) {}
+  };
+
+  const handleTitleBlur = () => {
+    setEditingTitle(false);
+    saveTitleToServer(meetingTitle);
+  };
+
+  const isFinalizing = connectionState === 'finalizing' || connectionState === 'completed';
+  const isRecording = connectionState === 'recording';
+  const isPaused = connectionState === 'paused';
+  const canStop = isRecording || isPaused;
+  const canPause = isRecording;
+  const canResume = isPaused;
+
   return (
-    <>
-      <audio ref={audioElementRef} autoPlay playsInline style={{ display: 'none' }} />
+    <div className="flex-1 flex flex-col overflow-hidden">
+      {/* Top bar */}
+      <div className="bg-white border-b border-slate-200 px-6 py-4 flex items-center justify-between flex-shrink-0">
+        <div className="flex items-center gap-4">
+          <button
+            onClick={() => navigate('/')}
+            className="text-slate-400 hover:text-slate-700 transition-colors"
+            title="Back to dashboard"
+          >
+            <i className="fas fa-arrow-left" />
+          </button>
+          {editingTitle ? (
+            <input
+              id="meeting-title-input"
+              autoFocus
+              value={meetingTitle}
+              onChange={e => setMeetingTitle(e.target.value)}
+              onBlur={handleTitleBlur}
+              onKeyDown={e => e.key === 'Enter' && handleTitleBlur()}
+              className="text-lg font-bold text-slate-800 border-b-2 border-indigo-400 outline-none bg-transparent px-1 min-w-48"
+            />
+          ) : (
+            <h2
+              id="meeting-title-display"
+              className="text-lg font-bold text-slate-800 cursor-pointer hover:text-indigo-700 transition-colors"
+              onClick={() => !started || !isFinalizing ? setEditingTitle(true) : undefined}
+              title="Click to edit title"
+            >
+              {meetingTitle}
+              {!isFinalizing && <i className="fas fa-pencil-alt text-xs text-slate-400 ml-2" />}
+            </h2>
+          )}
+        </div>
 
-      <div className="bg-white rounded-3xl shadow-xl border border-slate-200 overflow-hidden flex flex-col h-[650px] animate-in zoom-in-95 duration-300">
+        <div className="flex items-center gap-3">
+          <ConnectionBadge state={connectionState} />
+          {started && (
+            <span className="font-mono text-sm font-bold text-slate-700 bg-slate-100 px-3 py-1 rounded-lg">
+              {formatElapsed(elapsedSeconds)}
+            </span>
+          )}
+          <AudioBars level={audioLevel} active={captureState === 'active'} />
+        </div>
+      </div>
 
-        {/* Header */}
-        <div className="px-6 py-5 border-b border-slate-200 bg-slate-50 flex items-center justify-between">
-          <div className="flex items-center gap-4">
-            <div className="relative">
-              <div className={`w-12 h-12 rounded-xl flex items-center justify-center transition-all ${isBotConnected ? 'bg-indigo-600' : 'bg-slate-200'}`}>
-                <i className={`fas ${meetingLink ? 'fa-network-wired' : 'fa-microphone'} text-white text-lg`}></i>
-              </div>
-              {isBotConnected && (
-                <div className="absolute -bottom-1 -right-1 flex items-end gap-0.5 bg-white p-1 rounded-md shadow-sm border border-slate-100 h-5 w-12 overflow-hidden">
-                  {[1,2,3,4,5,6].map(i => (
-                    <div key={i} className="bg-indigo-500 w-1 rounded-full transition-all duration-75"
-                      style={{ height: `${Math.min(100, (audioLevel / 50) * (Math.random() * 50 + 50))}%` }} />
-                  ))}
-                </div>
-              )}
-            </div>
-            <div>
-              <h3 className="font-bold text-slate-800 leading-tight">
-                {meetingLink ? 'Meeting Transcriber' : 'Microphone Transcriber'}
-              </h3>
-              <p className="text-xs text-slate-500 font-medium">{status}</p>
-            </div>
+      {/* Error banners */}
+      {(appError || captureError) && (
+        <div className="bg-red-50 border-b border-red-200 px-6 py-3 flex items-start gap-3">
+          <i className="fas fa-exclamation-circle text-red-500 mt-0.5 flex-shrink-0" />
+          <div>
+            {appError && (
+              <>
+                <p className="text-red-800 font-semibold text-sm">{appError.message}</p>
+                {appError.code && (
+                  <p className="text-red-500 text-xs mt-0.5 font-mono">{appError.code}</p>
+                )}
+              </>
+            )}
+            {captureError && !appError && (
+              <p className="text-red-800 font-semibold text-sm">{captureError}</p>
+            )}
           </div>
-
-          <button onClick={stopListening} disabled={isProcessing}
-            className="flex items-center gap-2 px-6 py-2.5 bg-red-600 hover:bg-red-700 text-white rounded-xl text-sm font-bold shadow-lg shadow-red-100 transition-all disabled:opacity-50">
-            <i className="fas fa-power-off"></i>
-            {isProcessing ? 'Processing...' : 'Finish Session'}
+          <button
+            onClick={() => { setAppError(null); setCaptureError(null); }}
+            className="ml-auto text-red-400 hover:text-red-700"
+          >
+            <i className="fas fa-times" />
           </button>
         </div>
+      )}
 
-        {/* Status bar — always visible so you can debug */}
-        <div className={`px-4 py-2 text-xs font-semibold flex items-center justify-between
-          ${segmentCount > 0 ? 'bg-emerald-50 text-emerald-700 border-b border-emerald-100'
-                             : 'bg-amber-50 text-amber-700 border-b border-amber-100'}`}>
-          <span>
-            {segmentCount > 0
-              ? `✓ ${segmentCount} speech segment${segmentCount !== 1 ? 's' : ''} captured`
-              : '⏳ Waiting for speech — speak now'}
+      {/* Capture status bar */}
+      {started && (
+        <div className={`px-6 py-2 text-xs font-semibold flex items-center justify-between flex-shrink-0 ${
+          captureState === 'active' ? 'bg-emerald-50 text-emerald-700 border-b border-emerald-100'
+          : captureState === 'paused' ? 'bg-amber-50 text-amber-700 border-b border-amber-100'
+          : 'bg-slate-50 text-slate-500 border-b border-slate-100'
+        }`}>
+          <span className="flex items-center gap-2">
+            <span className={`w-2 h-2 rounded-full ${captureState === 'active' ? 'bg-emerald-500 animate-pulse' : captureState === 'paused' ? 'bg-amber-400' : 'bg-slate-300'}`} />
+            {captureState === 'active' ? 'Tab audio streaming' : captureState === 'paused' ? 'Paused' : captureState === 'stopped' ? 'Stopped' : 'Starting...'}
           </span>
-          <span className="opacity-60 text-[10px] uppercase tracking-widest">
-            {captureMode === 'display+mic' ? 'Tab Audio + Mic' : captureMode === 'mic' ? 'Mic Only' : 'Starting'}
+          <span className="opacity-60 uppercase tracking-widest">
+            {segments.length} segment{segments.length !== 1 ? 's' : ''}
           </span>
         </div>
+      )}
 
-        {/* Transcript feed */}
-        <div ref={scrollRef} className="flex-1 overflow-y-auto p-6 space-y-4 bg-slate-50/20">
-
-          {transcripts.filter(t => t.speaker !== 'System').length === 0 && !isProcessing && (
-            <div className="flex flex-col items-center justify-center py-10 text-slate-400 space-y-3">
-              <div className="w-16 h-16 bg-slate-100 rounded-full flex items-center justify-center text-2xl">
-                <i className="fas fa-comment-dots animate-pulse"></i>
-              </div>
-              <p className="text-sm font-medium text-center max-w-xs">
-                Speak clearly<br />
-                
-              </p>
+      {/* Main content */}
+      <div className="flex-1 overflow-hidden flex flex-col">
+        {/* Idle / Start screen */}
+        {!started && (
+          <div className="flex-1 flex flex-col items-center justify-center p-8 text-center">
+            <div className="w-20 h-20 bg-gradient-to-br from-indigo-500 to-purple-600 rounded-3xl flex items-center justify-center mb-6 shadow-xl shadow-indigo-200">
+              <i className="fas fa-wave-square text-white text-3xl" />
             </div>
-          )}
+            <h2 className="text-2xl font-extrabold text-slate-800 mb-2">Ready to Transcribe</h2>
+            <p className="text-slate-500 max-w-sm mb-8 text-sm leading-relaxed">
+              Click "Start Transcription" below. You'll be asked to select a browser tab — <strong>make sure to check "Share tab audio"</strong> in the popup.
+            </p>
 
-          {transcripts.map((entry, idx) => (
-            <div key={idx}
-              className={`flex flex-col ${entry.speaker === 'System' ? 'items-center' : 'items-start'} animate-in fade-in slide-in-from-left-2`}>
-              {entry.speaker === 'System' ? (
-                <div className="bg-indigo-50 border border-indigo-100 px-4 py-2 rounded-full shadow-sm">
-                  <span className="text-xs font-bold text-indigo-600 italic flex items-center gap-2 uppercase tracking-tight">
-                    <i className="fas fa-info-circle text-[10px]"></i>{entry.text}
-                  </span>
-                </div>
-              ) : (
-                <div className="max-w-[90%] group">
-                  <div className="flex items-center gap-2 mb-1.5 px-1">
-                    <span className="text-[10px] font-black uppercase tracking-widest text-indigo-600">Live Feed</span>
-                    <div className="h-px w-8 bg-slate-200"></div>
-                    <span className="text-[10px] text-slate-400 font-medium">
-                      {entry.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
-                    </span>
+            <div className="bg-indigo-50 border border-indigo-100 rounded-2xl p-5 max-w-md mb-8 text-left space-y-2">
+              {[
+                { icon: 'fa-desktop', text: 'Select the browser tab with your meeting' },
+                { icon: 'fa-volume-up', text: 'Check "Share tab audio" in the browser popup' },
+                { icon: 'fa-microphone', text: 'Speak in the meeting — transcription starts automatically' },
+              ].map((step, i) => (
+                <div key={i} className="flex items-start gap-3">
+                  <div className="w-7 h-7 rounded-lg bg-indigo-100 flex items-center justify-center flex-shrink-0 mt-0.5">
+                    <i className={`fas ${step.icon} text-indigo-600 text-xs`} />
                   </div>
-                  <div className="bg-white border border-slate-200 p-4 rounded-2xl rounded-tl-none shadow-sm group-hover:border-indigo-200 transition-colors">
-                    <p className="text-slate-800 leading-relaxed text-sm md:text-base font-medium">{entry.text}</p>
-                  </div>
+                  <p className="text-sm text-slate-700">{step.text}</p>
                 </div>
-              )}
+              ))}
             </div>
-          ))}
 
-          {isProcessing && (
-            <div className="flex flex-col items-center justify-center py-12 animate-in fade-in duration-700">
-              <div className="relative w-20 h-20 mb-6">
-                <div className="absolute inset-0 border-4 border-indigo-100 rounded-full"></div>
-                <div className="absolute inset-0 border-4 border-indigo-600 border-t-transparent rounded-full animate-spin"></div>
-                <div className="absolute inset-0 flex items-center justify-center">
-                  <i className="fas fa-brain text-indigo-600 text-2xl animate-pulse"></i>
-                </div>
-              </div>
-              <h4 className="text-indigo-900 font-bold text-xl mb-2">Creating Meeting Intelligence</h4>
-              <p className="text-slate-500 text-sm max-w-xs text-center font-medium">Summarizing session and extracting tasks...</p>
-            </div>
-          )}
-        </div>
-
-        {/* Manual input fallback */}
-        {!isProcessing && (
-          <div className="px-4 py-3 border-t border-slate-100 bg-white flex gap-2 items-center">
-            <span className="text-[10px] text-slate-400 font-bold uppercase tracking-wide whitespace-nowrap">Manual:</span>
-            <input type="text" value={manualText}
-              onChange={e => setManualText(e.target.value)}
-              onKeyDown={e => e.key === 'Enter' && handleManualAdd()}
-              placeholder="Mic not working? Paste transcript here and press Enter"
-              className="flex-1 text-xs px-3 py-2 border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-300 text-slate-700 placeholder-slate-400"
-            />
-            <button onClick={handleManualAdd} disabled={!manualText.trim()}
-              className="px-3 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-bold disabled:opacity-40 transition-all">
-              Add
+            <button
+              id="start-transcription-btn"
+              onClick={startMeeting}
+              className="bg-indigo-600 hover:bg-indigo-700 text-white font-bold px-10 py-4 rounded-2xl shadow-lg shadow-indigo-200 transition-all text-lg flex items-center gap-3"
+            >
+              <i className="fas fa-play" />
+              Start Transcription
             </button>
+
+            {captureError && (
+              <div className="mt-6 bg-amber-50 border border-amber-200 rounded-xl p-4 max-w-md text-left">
+                <p className="text-amber-800 font-semibold text-sm mb-1">
+                  <i className="fas fa-exclamation-triangle mr-2" />
+                  Capture failed
+                </p>
+                <p className="text-amber-700 text-sm">{captureError}</p>
+                <button
+                  onClick={() => { setCaptureError(null); setConnectionState('idle'); }}
+                  className="mt-3 text-xs font-bold text-amber-700 underline"
+                >
+                  Try again
+                </button>
+              </div>
+            )}
           </div>
         )}
 
-        {/* Footer */}
-        <div className="px-6 py-3 bg-slate-100 border-t border-slate-200 flex items-center justify-between text-[10px] font-bold text-slate-400 uppercase tracking-widest">
-          <span>Browser Speech</span>
-          <div className="flex gap-0.5">
-            {[1,2,3].map(i => (
-              <div key={i} className={`w-1.5 h-1.5 rounded-full ${isBotConnected ? 'bg-emerald-400' : 'bg-slate-300'}`} />
-            ))}
-          </div>
-        </div>
+        {/* Transcript feed */}
+        {started && (
+          <>
+            <div
+              ref={scrollRef}
+              id="transcript-feed"
+              className="flex-1 overflow-y-auto p-6 space-y-3"
+            >
+              {segments.length === 0 && !interimText && !isFinalizing && (
+                <div className="flex flex-col items-center justify-center py-16 text-slate-400">
+                  <i className="fas fa-comment-dots text-4xl animate-pulse mb-4" />
+                  <p className="text-sm font-medium">Listening for speech...</p>
+                  <p className="text-xs mt-1">Make sure the meeting tab audio is playing</p>
+                </div>
+              )}
+
+              {segments.map(seg => (
+                <div key={seg.id} className="flex flex-col items-start">
+                  <div className="flex items-center gap-2 mb-1 px-1">
+                    <span className={`text-[10px] font-black uppercase tracking-widest px-2 py-0.5 rounded-full border ${speakerColor(seg.speaker)}`}>
+                      {seg.speaker !== null ? `Speaker ${seg.speaker + 1}` : 'Speaker'}
+                    </span>
+                    {seg.startTime !== null && (
+                      <span className="text-[10px] text-slate-400 font-mono">
+                        {formatTimestamp(seg.startTime)}
+                      </span>
+                    )}
+                    {seg.confidence > 0 && (
+                      <span className="text-[10px] text-slate-300">
+                        {Math.round(seg.confidence * 100)}%
+                      </span>
+                    )}
+                  </div>
+                  <div className="max-w-[90%] bg-white border border-slate-200 p-4 rounded-2xl rounded-tl-none shadow-sm">
+                    <p className="text-slate-800 leading-relaxed text-sm font-medium">{seg.text}</p>
+                  </div>
+                </div>
+              ))}
+
+              {/* Interim text */}
+              {interimText && (
+                <div className="flex flex-col items-start opacity-60">
+                  <div className="flex items-center gap-2 mb-1 px-1">
+                    <span className="text-[10px] font-black uppercase tracking-widest px-2 py-0.5 rounded-full border bg-slate-100 text-slate-500 border-slate-200">
+                      Live...
+                    </span>
+                  </div>
+                  <div className="max-w-[90%] bg-slate-50 border border-dashed border-slate-200 p-4 rounded-2xl rounded-tl-none">
+                    <p className="text-slate-600 leading-relaxed text-sm italic">{interimText}</p>
+                  </div>
+                </div>
+              )}
+
+              {/* Finalizing state */}
+              {isFinalizing && (
+                <div className="flex flex-col items-center justify-center py-10">
+                  <div className="relative w-14 h-14 mb-4">
+                    <div className="absolute inset-0 border-4 border-purple-100 rounded-full" />
+                    <div className="absolute inset-0 border-4 border-purple-600 border-t-transparent rounded-full animate-spin" />
+                    <div className="absolute inset-0 flex items-center justify-center">
+                      <i className="fas fa-brain text-purple-600" />
+                    </div>
+                  </div>
+                  {analysisState === 'running' && (
+                    <p className="text-purple-700 font-semibold text-sm">Generating AI summary...</p>
+                  )}
+                  {analysisState === 'completed' && (
+                    <p className="text-emerald-700 font-semibold text-sm">
+                      <i className="fas fa-check-circle mr-2" />
+                      Analysis complete! Redirecting...
+                    </p>
+                  )}
+                  {analysisState === 'failed' && (
+                    <div className="text-center">
+                      <p className="text-amber-700 font-semibold text-sm">Analysis failed — transcript saved</p>
+                      {analysisError && <p className="text-amber-600 text-xs mt-1">{analysisError}</p>}
+                      <button
+                        onClick={() => navigate(`/meeting/${meetingId}/details`)}
+                        className="mt-3 text-sm font-bold text-indigo-600 underline"
+                      >
+                        View transcript anyway
+                      </button>
+                    </div>
+                  )}
+                  {analysisState === 'idle' && (
+                    <p className="text-slate-500 text-sm">Finalizing transcript...</p>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* Controls bar */}
+            {!isFinalizing && (
+              <div className="bg-white border-t border-slate-200 px-6 py-4 flex items-center justify-between flex-shrink-0">
+                <div className="flex items-center gap-3">
+                  {canPause && (
+                    <button
+                      id="pause-btn"
+                      onClick={pauseMeeting}
+                      className="flex items-center gap-2 px-5 py-2.5 bg-amber-100 hover:bg-amber-200 text-amber-800 rounded-xl font-bold text-sm transition-all"
+                    >
+                      <i className="fas fa-pause" />
+                      Pause
+                    </button>
+                  )}
+                  {canResume && (
+                    <button
+                      id="resume-btn"
+                      onClick={resumeMeeting}
+                      className="flex items-center gap-2 px-5 py-2.5 bg-sky-100 hover:bg-sky-200 text-sky-800 rounded-xl font-bold text-sm transition-all"
+                    >
+                      <i className="fas fa-play" />
+                      Resume
+                    </button>
+                  )}
+                </div>
+
+                {canStop && (
+                  <button
+                    id="stop-btn"
+                    onClick={stopMeeting}
+                    className="flex items-center gap-2 px-6 py-2.5 bg-red-600 hover:bg-red-700 text-white rounded-xl font-bold text-sm shadow-lg shadow-red-100 transition-all"
+                  >
+                    <i className="fas fa-stop" />
+                    Stop & Analyze
+                  </button>
+                )}
+              </div>
+            )}
+          </>
+        )}
       </div>
-    </>
+    </div>
   );
 };
 

@@ -10,8 +10,11 @@
   },
   "dependencies": {
     "react": "^19.2.3",
-    "@google/genai": "^1.34.0",
-    "react-dom": "^19.2.3"
+    "react-dom": "^19.2.3",
+    "react-router-dom": "^6.28.0",
+    "jspdf": "^2.5.1",
+    "jspdf-autotable": "^3.8.2",
+    "uuid": "^10.0.0"
   },
   "devDependencies": {
     "@types/node": "^22.14.0",
