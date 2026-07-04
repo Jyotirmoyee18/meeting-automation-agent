@@ -1,5 +1,4 @@
-import { jsPDF } from 'jspdf';
-import autoTable from 'jspdf-autotable';
+import html2pdf from 'html2pdf.js';
 import { Meeting, TranscriptSegment, MeetingAnalysis, AnalysisActionItem } from '../types';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -124,149 +123,129 @@ export function exportMarkdown(
 
 // ─── PDF Export ───────────────────────────────────────────────────────────────
 
-export function exportPdf(
+export async function exportPdf(
   meeting: Meeting,
   segments: TranscriptSegment[],
   analysis: MeetingAnalysis | null,
-): void {
-  const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
-  const pageW = doc.internal.pageSize.getWidth();
-  const margin = 15;
-  const contentW = pageW - margin * 2;
-  let y = margin;
+): Promise<void> {
+  const container = document.createElement('div');
+  container.style.position = 'absolute';
+  container.style.left = '-9999px';
+  container.style.top = '-9999px';
+  container.style.width = '800px'; // fixed width for PDF rendering
+  container.style.fontFamily = 'sans-serif';
+  
+  let html = `
+    <div style="padding: 40px; color: #334155; font-family: sans-serif;">
+      <div style="background-color: #4f46e5; color: white; padding: 20px 30px; border-radius: 8px; margin-bottom: 20px;">
+        <h1 style="margin: 0; font-size: 24px;">VoxNote AI</h1>
+        <p style="margin: 5px 0 0 0; font-size: 14px; opacity: 0.9;">Meeting Transcript & Analysis</p>
+      </div>
+      
+      <div style="margin-bottom: 30px;">
+        <h2 style="margin: 0 0 10px 0; font-size: 20px; color: #0f172a;">${meeting.title}</h2>
+        <p style="margin: 0 0 5px 0; font-size: 14px;"><strong>Date:</strong> ${formatDate(meeting.created_at)}</p>
+        <p style="margin: 0; font-size: 14px;"><strong>Duration:</strong> ${formatDuration(meeting.duration_seconds)}</p>
+      </div>
+  `;
 
-  const addPage = () => {
-    doc.addPage();
-    y = margin;
-  };
-
-  const checkPageBreak = (needed = 10) => {
-    if (y + needed > doc.internal.pageSize.getHeight() - margin) {
-      addPage();
-    }
-  };
-
-  const addHeading = (text: string, size = 14) => {
-    checkPageBreak(12);
-    doc.setFontSize(size);
-    doc.setFont('helvetica', 'bold');
-    doc.setTextColor(15, 23, 42);
-    doc.text(text, margin, y);
-    y += size * 0.5 + 3;
-    doc.setDrawColor(226, 232, 240);
-    doc.line(margin, y, pageW - margin, y);
-    y += 4;
-  };
-
-  const addBody = (text: string, size = 9) => {
-    doc.setFontSize(size);
-    doc.setFont('helvetica', 'normal');
-    doc.setTextColor(51, 65, 85);
-    const lines = doc.splitTextToSize(text, contentW) as string[];
-    lines.forEach(line => {
-      checkPageBreak(size * 0.5 + 2);
-      doc.text(line, margin, y);
-      y += size * 0.5 + 2;
-    });
-  };
-
-  const addBullet = (text: string) => {
-    checkPageBreak(6);
-    doc.setFontSize(9);
-    doc.setFont('helvetica', 'normal');
-    doc.setTextColor(51, 65, 85);
-    const wrapped = doc.splitTextToSize(`• ${text}`, contentW - 4) as string[];
-    wrapped.forEach((line, i) => {
-      checkPageBreak(5);
-      doc.text(line, margin + (i > 0 ? 4 : 0), y);
-      y += 5;
-    });
-  };
-
-  // ── Title page header ────────────────────────────────────────────────────
-  doc.setFillColor(79, 70, 229);
-  doc.rect(0, 0, pageW, 30, 'F');
-  doc.setFontSize(18);
-  doc.setFont('helvetica', 'bold');
-  doc.setTextColor(255, 255, 255);
-  doc.text('VoxNote AI', margin, 12);
-  doc.setFontSize(10);
-  doc.setFont('helvetica', 'normal');
-  doc.text('Meeting Transcript & Analysis', margin, 20);
-  y = 38;
-
-  // ── Meeting metadata ──────────────────────────────────────────────────────
-  addHeading(meeting.title, 14);
-  addBody(`Date: ${formatDate(meeting.created_at)}`);
-  addBody(`Duration: ${formatDuration(meeting.duration_seconds)}`);
-  y += 4;
-
-  // ── Analysis ──────────────────────────────────────────────────────────────
   if (analysis && analysis.status === 'completed') {
-    addHeading('Summary');
-    addBody(analysis.summary ?? '');
-    y += 3;
+    html += `
+      <h2 style="font-size: 18px; color: #0f172a; border-bottom: 1px solid #e2e8f0; padding-bottom: 5px; margin-top: 30px;">Summary</h2>
+      <p style="font-size: 14px; line-height: 1.6;">${analysis.summary || ''}</p>
+    `;
 
     if (analysis.keyPoints.length > 0) {
-      addHeading('Key Discussion Points');
-      analysis.keyPoints.forEach(p => addBullet(p));
-      y += 3;
+      html += `
+        <h2 style="font-size: 18px; color: #0f172a; border-bottom: 1px solid #e2e8f0; padding-bottom: 5px; margin-top: 20px;">Key Discussion Points</h2>
+        <ul style="font-size: 14px; line-height: 1.6; padding-left: 20px;">
+          ${analysis.keyPoints.map(p => `<li>${p}</li>`).join('')}
+        </ul>
+      `;
     }
 
     if (analysis.decisions.length > 0) {
-      addHeading('Decisions Made');
-      analysis.decisions.forEach(d => addBullet(d));
-      y += 3;
+      html += `
+        <h2 style="font-size: 18px; color: #0f172a; border-bottom: 1px solid #e2e8f0; padding-bottom: 5px; margin-top: 20px;">Decisions Made</h2>
+        <ul style="font-size: 14px; line-height: 1.6; padding-left: 20px;">
+          ${analysis.decisions.map(p => `<li>${p}</li>`).join('')}
+        </ul>
+      `;
     }
 
     if (analysis.actionItems.length > 0) {
-      addHeading('Action Items');
-      const tableData = analysis.actionItems.map(item => [
-        item.completed ? '✓' : '○',
-        item.task,
-        item.owner ?? '—',
-        item.deadline ?? '—',
-      ]);
-      autoTable(doc, {
-        startY: y,
-        head: [['', 'Task', 'Owner', 'Deadline']],
-        body: tableData,
-        margin: { left: margin, right: margin },
-        styles: { fontSize: 8, cellPadding: 2 },
-        headStyles: { fillColor: [79, 70, 229] as [number, number, number] },
-        columnStyles: { 0: { cellWidth: 8 }, 2: { cellWidth: 30 }, 3: { cellWidth: 25 } },
-        didDrawPage: () => { y = (doc as any).lastAutoTable.finalY + 4; },
-      });
-      y = (doc as any).lastAutoTable.finalY + 6;
+      html += `
+        <h2 style="font-size: 18px; color: #0f172a; border-bottom: 1px solid #e2e8f0; padding-bottom: 5px; margin-top: 20px;">Action Items</h2>
+        <table style="width: 100%; border-collapse: collapse; font-size: 14px; margin-top: 10px;">
+          <thead>
+            <tr style="background-color: #4f46e5; color: white;">
+              <th style="padding: 8px; text-align: left;">Status</th>
+              <th style="padding: 8px; text-align: left;">Task</th>
+              <th style="padding: 8px; text-align: left;">Owner</th>
+              <th style="padding: 8px; text-align: left;">Deadline</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${analysis.actionItems.map(item => `
+              <tr style="border-bottom: 1px solid #e2e8f0;">
+                <td style="padding: 8px;">${item.completed ? '✓' : '○'}</td>
+                <td style="padding: 8px;">${item.task}</td>
+                <td style="padding: 8px;">${item.owner ?? '—'}</td>
+                <td style="padding: 8px;">${item.deadline ?? '—'}</td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+      `;
     }
 
     if (analysis.followUpQuestions.length > 0) {
-      addHeading('Follow-up Questions');
-      analysis.followUpQuestions.forEach(q => addBullet(q));
-      y += 3;
+      html += `
+        <h2 style="font-size: 18px; color: #0f172a; border-bottom: 1px solid #e2e8f0; padding-bottom: 5px; margin-top: 20px;">Follow-up Questions</h2>
+        <ul style="font-size: 14px; line-height: 1.6; padding-left: 20px;">
+          ${analysis.followUpQuestions.map(p => `<li>${p}</li>`).join('')}
+        </ul>
+      `;
     }
   }
 
-  // ── Transcript ────────────────────────────────────────────────────────────
-  addHeading('Full Transcript');
+  html += `
+    <div style="page-break-before: always;"></div>
+    <h2 style="font-size: 18px; color: #0f172a; border-bottom: 1px solid #e2e8f0; padding-bottom: 5px; margin-bottom: 20px;">Full Transcript</h2>
+  `;
 
   segments.forEach(seg => {
     const ts = formatTimestamp(seg.startTime);
     const speaker = speakerLabel(seg.speaker);
-    const label = `${ts} ${speaker}:`;
-
-    checkPageBreak(10);
-    doc.setFontSize(8);
-    doc.setFont('helvetica', 'bold');
-    doc.setTextColor(79, 70, 229);
-    doc.text(label, margin, y);
-    y += 4;
-
-    addBody(seg.text, 9);
-    y += 2;
+    html += `
+      <div style="margin-bottom: 15px; page-break-inside: avoid;">
+        <div style="font-size: 12px; font-weight: bold; color: #4f46e5; margin-bottom: 4px;">
+          ${ts} ${speaker}:
+        </div>
+        <div style="font-size: 14px; line-height: 1.5; color: #334155;">
+          ${seg.text}
+        </div>
+      </div>
+    `;
   });
 
-  doc.save(`${slugify(meeting.title)}_report.pdf`);
+  html += `</div>`;
+  container.innerHTML = html;
+  document.body.appendChild(container);
+
+  const opt = {
+    margin: 10,
+    filename: `${slugify(meeting.title)}_report.pdf`,
+    image: { type: 'jpeg', quality: 0.98 },
+    html2canvas: { scale: 2, useCORS: true },
+    jsPDF: { unit: 'mm', format: 'a4', orientation: 'portrait' }
+  };
+
+  try {
+    await html2pdf().set(opt).from(container).save();
+  } finally {
+    document.body.removeChild(container);
+  }
 }
 
 // ─── Utility ──────────────────────────────────────────────────────────────────
